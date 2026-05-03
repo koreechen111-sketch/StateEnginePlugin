@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# SessionStart hook for State Engine Plugin
+# 会话启动时注入 E2E 插件使用说明和当前阶段的 SKILL 指导
+
+set -euo pipefail
+
+# 确定插件根目录
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# 用于 JSON 嵌入的转义函数
+escape_for_json() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+# === 1. 加载核心调度 SKILL (始终加载) ===
+using_e2e_file="${PLUGIN_ROOT}/skills/using-e2e/SKILL.md"
+if [[ -f "$using_e2e_file" ]]; then
+    using_e2e_content="$(cat "$using_e2e_file")"
+else
+    using_e2e_content="Error: using-e2e SKILL.md not found"
+fi
+
+# === 2. 查找 checkpoint.json 获取当前阶段 ===
+# Checkpoint 文件路径（动态，需要查找最新的需求目录）
+# 如果 CLAUDE_PROJECT_ROOT 未设置，尝试从当前目录向上查找项目根目录
+if [[ -z "${CLAUDE_PROJECT_ROOT:-}" ]]; then
+    # 从当前目录向上查找包含 .claude 目录的目录
+    current_dir="$(pwd)"
+    while [[ "$current_dir" != "/" ]]; do
+        if [[ -d "$current_dir/.claude" ]]; then
+            CLAUDE_PROJECT_ROOT="$current_dir"
+            break
+        fi
+        current_dir="$(dirname "$current_dir")"
+    done
+    # 如果没找到，使用当前目录
+    CLAUDE_PROJECT_ROOT="${CLAUDE_PROJECT_ROOT:-$(pwd)}"
+fi
+# 在 CLAUDE_PROJECT_ROOT/.claude/ 下查找最新的 checkpoint.json
+project_root="${CLAUDE_PROJECT_ROOT:-${PLUGIN_ROOT}}"
+checkpoint_dir="${project_root}/.claude"
+current_state=""
+
+if [[ -d "$checkpoint_dir" ]]; then
+    # 查找最新的 checkpoint.json（按修改时间倒序）
+    latest_checkpoint=$(find "$checkpoint_dir" -name "checkpoint.json" -type f 2>/dev/null | \
+                        while read -r f; do ls -t "$f" 2>/dev/null; done | head -1)
+
+    if [[ -n "$latest_checkpoint" && -f "$latest_checkpoint" ]]; then
+        # 提取 state 字段（使用 grep 和 sed，避免 jq 依赖）
+        current_state=$(grep -o '"state"[[:space:]]*:[[:space:]]*"[^"]*"' "$latest_checkpoint" | \
+                       sed 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)"/\1/')
+    fi
+fi
+
+# === 3. 阶段到 SKILL 目录映射 ===
+phase_skill_dir=""
+phase_display_name=""
+
+case "$current_state" in
+    REQUIREMENT)
+        phase_skill_dir="requirement"
+        phase_display_name="需求收集"
+        ;;
+    DESIGN)
+        phase_skill_dir="design"
+        phase_display_name="架构设计"
+        ;;
+    TEST_DESIGN)
+        phase_skill_dir="testcase"
+        phase_display_name="测试用例设计"
+        ;;
+    TASK_PLAN)
+        phase_skill_dir="task-planning"
+        phase_display_name="任务规划"
+        ;;
+    *)
+        # 未知阶段或无 checkpoint，不加载阶段 SKILL
+        ;;
+esac
+
+# === 4. 加载阶段 SKILL (如果存在) ===
+phase_skill_content=""
+if [[ -n "$phase_skill_dir" ]]; then
+    phase_skill_file="${PLUGIN_ROOT}/skills/${phase_skill_dir}/SKILL.md"
+    if [[ -f "$phase_skill_file" ]]; then
+        phase_skill_content="$(cat "$phase_skill_file")"
+    fi
+fi
+
+# === 5. 合并内容 ===
+if [[ -n "$phase_skill_content" ]]; then
+    # 同时加载了 using-e2e 和阶段 SKILL
+    final_content="${using_e2e_content}
+
+========== 当前阶段: ${phase_display_name} ==========
+
+${phase_skill_content}"
+else
+    # 只加载 using-e2e
+    final_content="$using_e2e_content"
+fi
+
+# === 6. 转义并输出 JSON ===
+final_escaped=$(escape_for_json "$final_content")
+
+printf '{\n  "hookSpecificOutput": {\n    "hookEventName": "SessionStart",\n    "additionalContext": "%s"\n  }\n}\n' "$final_escaped"
+
+exit 0

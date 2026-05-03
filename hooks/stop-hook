@@ -1,0 +1,484 @@
+#!/usr/bin/env bash
+#===============================================================================
+# Stop Hook 脚本 - State Engine Plugin
+# 功能：当用户尝试退出时，判断任务是否完成，决定是否继续执行
+# 参考：ralph-loop 的 stop-hook 逻辑
+#===============================================================================
+
+set -euo pipefail
+
+# 读取 hook 输入（高级 stop hook API）
+HOOK_INPUT=$(cat)
+
+# Checkpoint 文件路径（动态，需要查找最新的需求目录）
+# 如果 CLAUDE_PROJECT_ROOT 未设置，尝试从当前目录向上查找项目根目录
+if [[ -z "${CLAUDE_PROJECT_ROOT:-}" ]]; then
+    # 从当前目录向上查找包含 .claude 目录的目录
+    current_dir="$(pwd)"
+    while [[ "$current_dir" != "/" ]]; do
+        if [[ -d "$current_dir/.claude" ]]; then
+            CLAUDE_PROJECT_ROOT="$current_dir"
+            break
+        fi
+        current_dir="$(dirname "$current_dir")"
+    done
+    # 如果没找到，使用当前目录
+    CLAUDE_PROJECT_ROOT="${CLAUDE_PROJECT_ROOT:-$(pwd)}"
+fi
+
+#===============================================================================
+# 函数：查找最新的需求目录
+#===============================================================================
+state_engine_plugin_find_requirement_dir() {
+    local base_dir="$CLAUDE_PROJECT_ROOT/.claude"
+
+    if [[ ! -d "$base_dir" ]]; then
+        echo ""
+        return
+    fi
+
+    # 查找最新的需求目录（格式：yyyy-MM-dd-xxx）
+    local latest_dir
+    latest_dir=$(find "$base_dir" -maxdepth 1 -type d -name '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*' 2>/dev/null | sort -r | head -1)
+
+    if [[ -n "$latest_dir" && -d "$latest_dir/recovery" ]]; then
+        echo "$latest_dir/recovery/checkpoint.json"
+    else
+        echo ""
+    fi
+}
+
+# 获取 checkpoint 文件路径
+CHECKPOINT_FILE=$(state_engine_plugin_find_requirement_dir)
+
+# 调试输出
+if [[ -z "$CHECKPOINT_FILE" ]]; then
+    echo "未找到 checkpoint 文件"
+fi
+
+#===============================================================================
+# 函数：检查 checkpoint 是否存在且有活跃任务
+#===============================================================================
+state_engine_plugin_has_active_task() {
+    if [[ -z "$CHECKPOINT_FILE" || ! -f "$CHECKPOINT_FILE" ]]; then
+        return 1  # 无 checkpoint，无活跃任务
+    fi
+
+    # 提取状态
+    local state
+    state=$(grep -o '"state"[[:space:]]*:[[:space:]]*"[^"]*"' "$CHECKPOINT_FILE" 2>/dev/null | sed 's/.*: *"\([^"]*\)"/\1/' || echo "")
+
+    # INIT 或 DONE 状态视为无活跃任务
+    if [[ "$state" == "INIT" || "$state" == "DONE" ]]; then
+        return 1
+    fi
+
+    return 0  # 有活跃任务
+}
+
+#===============================================================================
+# 函数：检查任务是否已完成
+#===============================================================================
+state_engine_plugin_is_task_completed() {
+    if [[ -z "$CHECKPOINT_FILE" || ! -f "$CHECKPOINT_FILE" ]]; then
+        return 1
+    fi
+
+    local state
+    state=$(grep -o '"state"[[:space:]]*:[[:space:]]*"[^"]*"' "$CHECKPOINT_FILE" 2>/dev/null | sed 's/.*: *"\([^"]*\)"/\1/' || echo "")
+
+    [[ "$state" == "DONE" ]]
+}
+
+#===============================================================================
+# 函数：从 transcript 提取最后 AI 消息
+#===============================================================================
+state_engine_plugin_get_last_message() {
+    local transcript_path="$1"
+
+    if [[ ! -f "$transcript_path" ]]; then
+        echo ""
+        return
+    fi
+
+    # 提取最后一条 assistant 消息（使用 grep 而非 jq）
+    local last_assistant
+    last_assistant=$(grep '"role":"assistant"' "$transcript_path" 2>/dev/null | tail -1 || echo "")
+
+    if [[ -z "$last_assistant" ]]; then
+        echo ""
+        return
+    fi
+
+    # 提取 message.content 中 type=text 的 text 字段
+    # JSON 格式: "content":[{"type":"text","text":"xxx"},...]
+    local last_output
+    last_output=$(echo "$last_assistant" | sed -n 's/.*"content"\s*:\s*\[\s*{[^}]*"type"\s*:\s*"text"[^}]*"text"\s*:\s*"\([^"]*\)"[^}]*}.*]}/\1/p' | head -1)
+
+    # 如果上面的正则没匹配到，尝试更简单的提取方式
+    if [[ -z "$last_output" ]]; then
+        last_output=$(echo "$last_assistant" | sed -n 's/.*"text"\s*:\s*"\([^"]*\)".*/\1/p' | head -1)
+    fi
+
+    echo "$last_output"
+}
+
+#===============================================================================
+# 函数：检查是否需要用户反馈（允许退出）
+#===============================================================================
+state_engine_plugin_needs_user_feedback() {
+    local message="$1"
+
+    # 统一转小写（兼容英文）
+    local msg
+    msg=$(echo "$message" | tr '[:upper:]' '[:lower:]')
+
+    # 正则规则（覆盖中英文 + 多表达方式）
+    local pattern='(请.*(提供|输入|填写|补充|说明|告知|告诉|确认|选择|决定|审批|反馈))|(需要.*(你|您).*(提供|确认|选择|输入|补充|说明|反馈))|(等待.*(你|您)?.*(确认|回复|反馈))|(是否.*(需要|继续|确认|选择))|(你可以.*(提供|选择|告诉))|(请输入)|(please.*(provide|input|enter|confirm|select))|((can|could|would) you.*(provide|confirm|choose|select|tell|input))|(need (you|your).*(input|confirmation|selection|feedback))|(waiting for.*(your|user).*(input|confirmation|feedback))|(requires?.*(input|confirmation|selection))'
+
+    if echo "$msg" | grep -Eq "$pattern"; then
+        return 0
+    fi
+
+    return 1
+}
+
+#===============================================================================
+# 函数：检查是否询问是否继续（需要继续执行）
+#===============================================================================
+state_engine_plugin_asks_continue() {
+    local message="$1"
+
+    # 询问是否继续的关键词
+    local continue_keywords=("是否继续" "要继续吗" "continue?" "继续吗" "要继续么"
+                            "是否需要继续" "要不要继续" "next?" "下一步")
+
+    for keyword in "${continue_keywords[@]}"; do
+        if echo "$message" | grep -qi "$keyword"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+#===============================================================================
+# 函数：检查是否有未提交的代码变更（需要继续执行）
+#===============================================================================
+state_engine_plugin_has_uncommitted_changes() {
+    # 检查是否有未提交的变更
+    if git status --porcelain 2>/dev/null | grep -q '^[MADRC]'; then
+        return 0
+    fi
+    return 1
+}
+
+#===============================================================================
+# 函数：检查测试是否失败（需要继续执行）
+#===============================================================================
+state_engine_plugin_tests_failed() {
+    local message="$1"
+
+    # 测试失败的关键词
+    local fail_keywords=("测试失败" "test failed" "tests failed" "测试未通过"
+                        "测试不通过" "assertion failed" "测试错误")
+
+    for keyword in "${fail_keywords[@]}"; do
+        if echo "$message" | grep -qi "$keyword"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+#===============================================================================
+# 函数：检查所有测试是否通过（允许退出）
+#===============================================================================
+state_engine_plugin_all_tests_passed() {
+    local message="$1"
+
+    # 测试全部通过的关键词
+    local pass_keywords=("所有测试通过" "测试全部通过" "all tests passed"
+                        "测试通过" "测试成功")
+
+    for keyword in "${pass_keywords[@]}"; do
+        if echo "$message" | grep -qi "$keyword"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+#===============================================================================
+# 函数：检查是否有 TODO/FIXME 未完成（需要继续执行）
+#===============================================================================
+state_engine_plugin_has_pending_todos() {
+    local message="$1"
+
+    # 待办事项相关的关键词
+    local todo_keywords=("TODO" "FIXME" "待完成" "还未完成" "未完成")
+
+    for keyword in "${todo_keywords[@]}"; do
+        if echo "$message" | grep -qi "$keyword"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+#===============================================================================
+# 函数：检查是否需要外部依赖（允许退出）
+#===============================================================================
+state_engine_plugin_needs_external_dependency() {
+    local message="$1"
+
+    # 等待外部依赖的关键词
+    local dep_keywords=("等待外部" "等待服务" "等待API" "需要等待"
+                       "依赖不可用" "等待部署" "等待环境")
+
+    for keyword in "${dep_keywords[@]}"; do
+        if echo "$message" | grep -qi "$keyword"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+#===============================================================================
+# 函数：检查 Review 是否未通过（需要继续执行）
+#===============================================================================
+state_engine_plugin_review_not_passed() {
+    local message="$1"
+
+    # Review 未通过的关键词
+    local review_keywords=("review 未通过" "review未通过" "评审未通过"
+                          "review failed" "评审不通过" "需要修改")
+
+    for keyword in "${review_keywords[@]}"; do
+        if echo "$message" | grep -qi "$keyword"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+#===============================================================================
+# 函数：检查是否正常结束（允许退出）
+#===============================================================================
+state_engine_plugin_is_normal_end() {
+    local message="$1"
+
+    # 正常结束语
+    local end_keywords=("State-Engine-Plugin:任务已完成")
+
+    for keyword in "${end_keywords[@]}"; do
+        if echo "$message" | grep -qi "$keyword"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+#===============================================================================
+# 函数：检查是否有严重错误（允许退出）
+#===============================================================================
+state_engine_plugin_has_critical_error() {
+    local message="$1"
+
+    # 严重错误关键词
+    local error_keywords=("无法继续" "致命错误" "严重错误" "无法恢复"
+                         "系统错误" "崩溃" "fatal error")
+
+    for keyword in "${error_keywords[@]}"; do
+        if echo "$message" | grep -qi "$keyword"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+#===============================================================================
+# 函数：检查是否正在进行重构（需要继续执行）
+#===============================================================================
+state_engine_plugin_is_refactoring() {
+    local message="$1"
+
+    # 重构相关的关键词
+    local refactor_keywords=("重构" "refactoring" "重构中" "正在重构")
+
+    for keyword in "${refactor_keywords[@]}"; do
+        if echo "$message" | grep -qi "$keyword"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+#===============================================================================
+# 函数：检查用户是否明确要求退出（允许退出）
+#===============================================================================
+state_engine_plugin_user_explicit_exit() {
+    local message="$1"
+
+    # 用户明确退出的关键词
+    local exit_keywords=("退出" "结束" "完成" "可以了" "不需要了")
+
+    for keyword in "${exit_keywords[@]}"; do
+        if echo "$message" | grep -qi "$keyword"; then
+            # 排除"未完成"、"未退出"等否定情况
+            if ! echo "$message" | grep -qi "未完成"; then
+                return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
+#===============================================================================
+# 主逻辑
+#===============================================================================
+main() {
+    # 1. 检查是否有活跃任务
+    if ! state_engine_plugin_has_active_task; then
+        echo "State Engine Plugin: 无活跃任务，允许退出"
+        exit 0
+    fi
+
+    # 2. 检查任务是否已完成
+    if state_engine_plugin_is_task_completed; then
+        echo "State Engine Plugin: 任务已完成，允许退出"
+        exit 0
+    fi
+
+    # 3. 直接从 hook 输入获取 last_assistant_message 的最后一行
+    # 注意：需要先提取完整的消息内容（包含转义字符），再解码换行符后取最后一行
+    local last_message_raw
+    last_message_raw=$(echo "$HOOK_INPUT" | sed -n 's/.*"last_assistant_message"[[:space:]]*:[[:space:]]*"\(.*\)".*/\1/p' | head -1)
+
+    # 解码 \n 为换行符，然后取最后一行
+    if [[ -n "$last_message_raw" && "$last_message_raw" != "null" ]]; then
+        last_message=$(echo "$last_message_raw" | sed 's/\\n/\n/g' | tail -1)
+    fi
+
+    if [[ -z "$last_message" || "$last_message" == "null" ]]; then
+        # 兼容：如果 last_assistant_message 不存在，尝试从 transcript_path 获取
+        local transcript_path
+        transcript_path=$(echo "$HOOK_INPUT" | sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+
+        if [[ -n "$transcript_path" && "$transcript_path" != "null" && -f "$transcript_path" ]]; then
+            last_message=$(state_engine_plugin_get_last_message "$transcript_path")
+        fi
+    fi
+
+    if [[ -z "$last_message" ]]; then
+        echo "State Engine Plugin: 无法获取最后消息，允许退出"
+        exit 0
+    fi
+
+    # 5. 场景判断（优先级从高到低）
+
+    # 场景A：需要用户反馈 → 允许退出
+    if state_engine_plugin_needs_user_feedback "$last_message"; then
+        echo "State Engine Plugin: 需要用户反馈，允许退出"
+        exit 0
+    fi
+
+    # 场景B：正常结束 → 允许退出
+    if state_engine_plugin_is_normal_end "$last_message"; then
+        echo "State Engine Plugin: 正常结束，允许退出"
+        exit 0
+    fi
+
+    # 场景C：用户明确退出 → 允许退出
+    if state_engine_plugin_user_explicit_exit "$last_message"; then
+        echo "State Engine Plugin: 用户明确退出，允许退出"
+        exit 0
+    fi
+
+    # 场景D：有严重错误 → 允许退出
+    if state_engine_plugin_has_critical_error "$last_message"; then
+        echo "State Engine Plugin: 严重错误，允许退出"
+        exit 0
+    fi
+
+    # 场景E：所有测试通过 → 允许退出
+    if state_engine_plugin_all_tests_passed "$last_message"; then
+        echo "State Engine Plugin: 所有测试通过，允许退出"
+        exit 0
+    fi
+
+    # 场景F：需要外部依赖 → 允许退出
+    if state_engine_plugin_needs_external_dependency "$last_message"; then
+        echo "State Engine Plugin: 需要外部依赖，允许退出"
+        exit 0
+    fi
+
+    # 场景G：询问是否继续 → 继续执行
+    if state_engine_plugin_asks_continue "$last_message"; then
+
+        # 构建继续执行的提示
+        local continue_prompt="任务尚未完成，请使用state-engine-plugin继续执行当前任务。"
+        local state_name
+        state_name=$(grep -o '"state"[[:space:]]*:[[:space:]]*"[^"]*"' "$CHECKPOINT_FILE" 2>/dev/null | sed 's/.*: *"\([^"]*\)"/\1/' || echo "UNKNOWN")
+
+        printf '{"decision":"block","reason":"%s","systemMessage":"%s"}\n' "$continue_prompt" "State Engine Plugin 继续执行 | 当前状态: $state_name | 请继续完成未完成的任务"
+        exit 2
+    fi
+
+    # 场景H：测试失败 → 继续执行
+    if state_engine_plugin_tests_failed "$last_message"; then
+
+        printf '{"decision":"block","reason":"%s","systemMessage":"%s"}\n' "测试失败，请使用state-engine-plugin修复问题后继续执行。" "State Engine Plugin 继续执行 | 测试失败，请修复"
+        exit 2
+    fi
+
+    # 场景I：Review 未通过 → 继续执行
+    if state_engine_plugin_review_not_passed "$last_message"; then
+
+        printf '{"decision":"block","reason":"%s","systemMessage":"%s"}\n' "Review 未通过，请根据评审意见修改后使用state-engine-plugin继续执行。" "State Engine Plugin 继续执行 | Review 未通过，请修改"
+        exit 2
+    fi
+
+    # 场景J：有待办事项未完成 → 继续执行
+    if state_engine_plugin_has_pending_todos "$last_message"; then
+
+        printf '{"decision":"block","reason":"%s","systemMessage":"%s"}\n' "有待办事项未完成，请使用state-engine-plugin继续执行。" "State Engine Plugin 继续执行 | 待办事项未完成"
+        exit 2
+    fi
+
+    # 场景K：代码变更未提交 → 继续执行
+    if state_engine_plugin_has_uncommitted_changes; then
+
+        printf '{"decision":"block","reason":"%s","systemMessage":"%s"}\n' "有未提交的代码变更，请提交后使用state-engine-plugin继续执行。" "State Engine Plugin 继续执行 | 有未提交变更"
+        exit 2
+    fi
+
+    # 场景L：正在进行重构 → 继续执行
+    if state_engine_plugin_is_refactoring "$last_message"; then
+
+        printf '{"decision":"block","reason":"%s","systemMessage":"%s"}\n' "重构尚未完成，请使用state-engine-plugin继续执行。" "State Engine Plugin 继续执行 | 重构进行中"
+        exit 2
+    fi
+
+    # 默认：有活跃任务且未完成 → 继续执行
+    local state_name
+    state_name=$(grep -o '"state"[[:space:]]*:[[:space:]]*"[^"]*"' "$CHECKPOINT_FILE" | sed 's/.*: *"\([^"]*\)"/\1/')
+
+    printf '{"decision":"block","reason":"%s","systemMessage":"%s"}\n' "当前任务尚未完成，请使用state-engine-plugin继续执行。" "State Engine Plugin 继续执行 | 当前状态: $state_name | 任务未完成"
+
+    exit 2
+}
+
+# 只在直接运行时执行主逻辑（不是 source 时）
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
